@@ -1,30 +1,46 @@
 {
   "expo": {
     "name": "v0.42",
-    "slug": "v0.42",
+    "slug": "v0-42",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
+
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.moux.v0.x42"
+      "bundleIdentifier": "com.moux.v0x42",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Cette application nécessite l'accès à la caméra pour détecter vos gestes et prendre des photos.",
+        "NSMicrophoneUsageDescription": "Certaines fonctions peuvent nécessiter un accès au microphone.",
+        "NSPhotoLibraryAddUsageDescription": "L'application doit pouvoir enregistrer des photos dans votre galerie."
+      }
     },
+
     "android": {
+      "package": "com.moux.v0x42",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false,
-      "package": "com.moux.v0.x42"
+      "predictiveBackGestureEnabled": false
     },
+
+    "plugins": ["react-native-vision-camera"],
+
     "web": {
       "favicon": "./assets/favicon.png"
     }
