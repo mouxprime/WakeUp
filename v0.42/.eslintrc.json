@@ -1,0 +1,8 @@
+{
+    "root": true,
+    "extends": ["universe/native"],
+    "env": {
+      "browser": true,
+      "es6": true
+    }
+  }
