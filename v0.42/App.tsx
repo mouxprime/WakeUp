@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity } from 'react-native';
+import { Alert, StyleSheet, Text, View, TouchableOpacity } from 'react-native';
 import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import type { FrameAnalysisResult } from './frameProcessors/useEntropyFrameProcessor';
 import { useEntropyFrameProcessor } from './frameProcessors/useEntropyFrameProcessor';
+import { loadHandDetectorModel, loadHandLandmarksModel } from './ml/handModels';
 
 export default function App() {
   const device = useCameraDevice('back');
@@ -18,6 +19,28 @@ export default function App() {
       requestPermission();
     }
   }, [hasPermission, requestPermission]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const detector = await loadHandDetectorModel();
+        const landmarks = await loadHandLandmarksModel();
+
+        console.log('Hand detector model loaded:', {
+          inputs: detector.inputs,
+          outputs: detector.outputs,
+        });
+
+        console.log('Hand landmarks model loaded:', {
+          inputs: landmarks.inputs,
+          outputs: landmarks.outputs,
+        });
+      } catch (e) {
+        console.error('Error loading TFLite models', e);
+        Alert.alert('ML error', 'Impossible de charger les modèles TFLite');
+      }
+    })();
+  }, []);
 
   const handleFrameAnalyzed = useCallback((result: FrameAnalysisResult) => {
     setDetectionCount((c) => c + 1);
