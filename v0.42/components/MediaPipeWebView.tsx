@@ -132,7 +132,7 @@ export const MediaPipeWebView: React.FC<MediaPipeWebViewProps> = ({
       }
 
       try {
-        const startTime = performance.now();
+        const startTime = Date.now();
 
         // Détection des mains
         const handResults = await handLandmarker.detectForVideo(video, startTime);

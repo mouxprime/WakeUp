@@ -20,13 +20,17 @@ import { loadHandDetectorModel, loadHandLandmarksModel } from './ml/handModels';
 import { useTensorflowModel } from 'react-native-fast-tflite';
 import { useResizePlugin } from 'vision-camera-resize-plugin';
 import { useRunOnJS } from 'react-native-worklets-core';
-
-type HandPoint = { x: number; y: number };
-type HandLandmarksPayload = {
-  landmarks: Array<Array<HandPoint>>;
-  frameWidth: number;
-  frameHeight: number;
-};
+import {
+  interpretFrame,
+  palmDetectionAnchors,
+  prepareDetections,
+  type FrameMeta,
+  type HandState,
+  type Landmark3D,
+  type MLRawDetectorOutput,
+  type MLRawLandmarksOutput,
+  type SceneInterpretation,
+} from './vision/interpretation';
 
 const HAND_CONNECTIONS: Array<[number, number]> = [
   [0, 1],
@@ -55,6 +59,8 @@ const HAND_CONNECTIONS: Array<[number, number]> = [
 ];
 
 const LANDMARK_LINE_THICKNESS = 2;
+const MAX_HANDS = 2;
+const DETECTION_SCORE_THRESHOLD = 0.55;
 
 export default function App() {
   const ultraWideDevice = useCameraDevice('back', {
@@ -77,13 +83,14 @@ export default function App() {
   const [lastFrameAnalysis, setLastFrameAnalysis] =
     useState<FrameAnalysisResult | null>(null);
   const [detectedHandsCount, setDetectedHandsCount] = useState(0);
-  const [detectedLandmarks, setDetectedLandmarks] = useState<Array<Array<HandPoint>>>([]);
-  const [smoothedLandmarks, setSmoothedLandmarks] = useState<Array<Array<HandPoint>>>([]);
+  const [sceneInterpretation, setSceneInterpretation] =
+    useState<SceneInterpretation | null>(null);
   const [useSmoothedLandmarks, setUseSmoothedLandmarks] = useState(true); // Par défaut activé pour stabilité
   const [currentLens, setCurrentLens] = useState<'ultra' | 'wide'>('ultra');
   const frameDimensionsRef = useRef({ width: 0, height: 0 });
-  const landmarkHistoryRef = useRef<Array<Array<Array<HandPoint>>>>([]);
+  const handHistoryRef = useRef<Record<string, Landmark3D[][]>>({});
   const maxHistorySize = 3;
+  const anchors = React.useMemo(() => palmDetectionAnchors, []);
 
   useEffect(() => {
     if (!hasPermission) {
@@ -178,20 +185,26 @@ export default function App() {
   // Plugin de resize (utilisé côté worklet)
   const { resize } = useResizePlugin();
 
-  // Callback JS quand on a compté les mains
-  const onHandsDetected = useRunOnJS((numHands: number) => {
-    console.log('Hands détectées (heuristique):', numHands);
-    setDetectedHandsCount(numHands);
-  },
-    []
-  );
-
   // Callback JS pour compter les frames traitées (juste pour l’affichage)
   const onFrameProcessed = useRunOnJS(() => {
     setDetectionCount((c) => c + 1);
   }, 
     []
   );
+
+  const onSceneUpdated = useRunOnJS((interpretation: SceneInterpretation) => {
+    frameDimensionsRef.current = {
+      width: interpretation.rawMeta.frameWidth,
+      height: interpretation.rawMeta.frameHeight,
+    };
+
+    if (interpretation.hands.length === 0) {
+      handHistoryRef.current = {};
+    }
+
+    setDetectedHandsCount(interpretation.hands.length);
+    setSceneInterpretation(interpretation);
+  }, []);
 
   const handleToggleLensMode = useCallback(() => {
     if (currentLens === 'ultra') {
@@ -203,115 +216,116 @@ export default function App() {
     }
   }, [currentLens, isUltraAvailable, isWideAvailable]);
 
-  const cloneLandmarks = (hands: Array<Array<HandPoint>>): Array<Array<HandPoint>> =>
-    hands.map((hand) => hand.map((point) => ({ ...point })));
-
-const hasSignificantMovement = (
-  current: Array<Array<HandPoint>>,
-  previous: Array<Array<HandPoint>>,
-  threshold: number,
-): boolean => {
-  for (let handIndex = 0; handIndex < current.length; handIndex++) {
-    const currentHand = current[handIndex];
-    const previousHand = previous[handIndex];
-
-    if (!previousHand || currentHand.length !== previousHand.length) {
-      continue;
-    }
-
-    for (let i = 0; i < currentHand.length; i++) {
-      const dx = currentHand[i].x - previousHand[i].x;
-      const dy = currentHand[i].y - previousHand[i].y;
-      if (Math.hypot(dx, dy) > threshold) {
-        return true;
+  const hasSignificantMovement3D = React.useCallback(
+    (current: Landmark3D[], previous: Landmark3D[], threshold: number) => {
+      for (let i = 0; i < current.length; i++) {
+        const prev = previous[i];
+        if (!prev) continue;
+        const dx = current[i].x - prev.x;
+        const dy = current[i].y - prev.y;
+        if (Math.hypot(dx, dy) > threshold) {
+          return true;
+        }
       }
-    }
-  }
-  return false;
-};
+      return false;
+    },
+    [],
+  );
 
-  // Fonction pour lisser les landmarks (réduire le bruit avec un buffer circulaire)
-  const smoothLandmarks = (current: Array<Array<HandPoint>>): Array<Array<HandPoint>> => {
-    if (current.length === 0) {
-      landmarkHistoryRef.current = [];
-      return current;
+  const handsForDisplay = React.useMemo<HandState[]>(() => {
+    if (!sceneInterpretation) {
+      handHistoryRef.current = {};
+      return [];
     }
 
-    const previousFrame =
-      landmarkHistoryRef.current[landmarkHistoryRef.current.length - 1];
+    const hands = sceneInterpretation.hands;
+    if (hands.length === 0) {
+      handHistoryRef.current = {};
+      return [];
+    }
+
+    if (!useSmoothedLandmarks) {
+      const nextHistory: Record<string, Landmark3D[][]> = {};
+      hands.forEach((hand) => {
+        nextHistory[hand.id] = [hand.landmarks.map((point) => ({ ...point }))];
+      });
+      handHistoryRef.current = nextHistory;
+      return hands;
+    }
 
     const frameMinSize =
       Math.min(
         frameDimensionsRef.current.width || previewSize || 0,
         frameDimensionsRef.current.height || previewSize || 0,
       ) || 1;
-    const movementThreshold = frameMinSize * 0.08; // 8% du plus petit côté
+    const movementThreshold = frameMinSize * 0.08;
+    const nextHistory: Record<string, Landmark3D[][]> = { ...handHistoryRef.current };
 
-    if (
-      previousFrame &&
-      hasSignificantMovement(current, previousFrame, movementThreshold)
-    ) {
-      landmarkHistoryRef.current = [cloneLandmarks(current)];
-      return current;
-    }
+    const smoothed = hands.map((hand) => {
+      const history = nextHistory[hand.id] ?? [];
+      if (
+        history.length > 0 &&
+        hasSignificantMovement3D(hand.landmarks, history[history.length - 1], movementThreshold)
+      ) {
+        nextHistory[hand.id] = [];
+      }
+      const updatedHistory = [...(nextHistory[hand.id] ?? [])];
+      updatedHistory.push(hand.landmarks.map((point) => ({ ...point })));
+      if (updatedHistory.length > maxHistorySize) {
+        updatedHistory.shift();
+      }
+      nextHistory[hand.id] = updatedHistory;
 
-    // Ajouter le frame actuel à l'historique
-    landmarkHistoryRef.current.push(cloneLandmarks(current));
-    if (landmarkHistoryRef.current.length > maxHistorySize) {
-      landmarkHistoryRef.current.shift(); // Garder seulement les N derniers
-    }
+      if (updatedHistory.length < 2) {
+        return hand;
+      }
 
-    if (landmarkHistoryRef.current.length < 2) return current;
-
-    const smoothed: Array<Array<HandPoint>> = current.map((hand, handIndex) =>
-      hand.map((point, pointIndex) => {
+      const averaged = hand.landmarks.map((_, index) => {
         let sumX = 0;
         let sumY = 0;
+        let sumZ = 0;
         let count = 0;
-
-        for (const historyFrame of landmarkHistoryRef.current) {
-          const historyHand = historyFrame[handIndex];
-          if (historyHand && historyHand[pointIndex]) {
-            sumX += historyHand[pointIndex].x;
-            sumY += historyHand[pointIndex].y;
+        for (const framePoints of updatedHistory) {
+          const point = framePoints[index];
+          if (point) {
+            sumX += point.x;
+            sumY += point.y;
+            sumZ += point.z;
             count++;
           }
         }
-
         if (count === 0) {
-          return point;
+          return hand.landmarks[index];
         }
-
         return {
           x: sumX / count,
           y: sumY / count,
+          z: sumZ / count,
         };
-      }),
-    );
+      });
+
+      return {
+        ...hand,
+        landmarks: averaged,
+      };
+    });
+
+    const activeIds = new Set(hands.map((hand) => hand.id));
+    Object.keys(nextHistory).forEach((id) => {
+      if (!activeIds.has(id)) {
+        delete nextHistory[id];
+      }
+    });
+    handHistoryRef.current = nextHistory;
 
     return smoothed;
-  };
+  }, [sceneInterpretation, useSmoothedLandmarks, previewSize, hasSignificantMovement3D, maxHistorySize]);
 
   // Supprimé : la correction d'orientation forcée
   // Le modèle MediaPipe landmarks gère naturellement les différentes orientations
 
-  // Callback JS pour mettre à jour les landmarks détectés
-  const onLandmarksDetected = useRunOnJS((payload: HandLandmarksPayload) => {
-    frameDimensionsRef.current = {
-      width: payload.frameWidth,
-      height: payload.frameHeight,
-    };
-
-    const smoothed = smoothLandmarks(payload.landmarks);
-
-    setDetectedLandmarks(payload.landmarks);
-    setSmoothedLandmarks(smoothed);
-  },
-  []
-  );
-
   const mapPointToScreen = useCallback(
-    (point: HandPoint) => {
+    (point: { x: number; y: number }) => {
       const frameWidth = frameDimensionsRef.current.width;
       const frameHeight = frameDimensionsRef.current.height;
       const displayWidth = previewSize || 1;
@@ -364,16 +378,37 @@ const hasSignificantMovement = (
     (frame) => {
       'worklet';
 
-      if (detectorModel == null || detectorInputSize == null || landmarkModel == null || landmarksInputSize == null) {
+      if (
+        detectorModel == null ||
+        detectorInputSize == null ||
+        landmarkModel == null ||
+        landmarksInputSize == null
+      ) {
         return;
       }
 
-      const { width: detectorWidth, height: detectorHeight, dataType: detectorDataType } = detectorInputSize;
-      const { width: landmarksWidth, height: landmarksHeight, dataType: landmarksDataType } = landmarksInputSize;
+      const { width: detectorWidth, height: detectorHeight, dataType: detectorDataType } =
+        detectorInputSize;
+      const {
+        width: landmarksWidth,
+        height: landmarksHeight,
+        dataType: landmarksDataType,
+      } = landmarksInputSize;
+
+      const frameId =
+        typeof frame.timestamp === 'number'
+          ? frame.timestamp
+          : Date.now();
+
+      const meta: FrameMeta = {
+        frameWidth: frame.width,
+        frameHeight: frame.height,
+        modelInputWidth: detectorWidth,
+        modelInputHeight: detectorHeight,
+        frameId,
+      };
 
       runAtTargetFps(20, () => {
-
-        // 1) Resize la frame au format attendu par le modèle de détection (192x192)
         const resized = resize(frame, {
           scale: {
             width: detectorWidth,
@@ -383,61 +418,30 @@ const hasSignificantMovement = (
           dataType: detectorDataType === 'float32' ? 'float32' : 'uint8',
         });
 
-        // 2) Inference TFLite synchrone du modèle de détection
-        const detectorOutputs = detectorModel.runSync([resized]);
+        const detectorOutputs = detectorModel.runSync([resized]) as Array<Float32Array>;
+        const rawBoxes = detectorOutputs[0] as Float32Array;
+        const rawScores = detectorOutputs[1] as Float32Array;
 
-        // outputs[0] : [1, 2016, 18] → boîtes englobantes et points de repère de paume
-        // outputs[1] : [1, 2016, 1] → scores (logits)
-        const rawBoxes = detectorOutputs[0] as Float32Array; // [1, 2016, 18]
-        const rawScores = detectorOutputs[1] as Float32Array; // [1, 2016, 1]
+        const detectorOutput: MLRawDetectorOutput = {
+          rawBoxes,
+          rawScores,
+        };
 
-        // 3) Appliquer sigmoid aux scores
-        const scores = new Float32Array(rawScores.length);
-        for (let i = 0; i < rawScores.length; i++) {
-          scores[i] = 1 / (1 + Math.exp(-rawScores[i]));
-        }
+        const prepared = prepareDetections(detectorOutput, anchors, meta, {
+          maxHands: MAX_HANDS,
+          scoreThreshold: DETECTION_SCORE_THRESHOLD,
+        });
 
-        // 4) Approche simplifiée : utiliser les positions approximatives des détections
-        // Pour MediaPipe, on peut estimer la position de la main à partir des scores élevés
-        // et faire un crop conservateur autour du centre de la frame
-        const highScoreIndices: number[] = [];
-        for (let i = 0; i < scores.length; i++) {
-          if (scores[i] >= 0.7) {
-            highScoreIndices.push(i);
-          }
-        }
+        const landmarkResults: MLRawLandmarksOutput[] = [];
+        for (let i = 0; i < prepared.roiBoxesOnFrame.length; i++) {
+          if (i >= MAX_HANDS) break;
+          const roi = prepared.roiBoxesOnFrame[i];
 
-        // Prendre max 1 main avec un score très élevé pour plus de stabilité
-        highScoreIndices.sort((a, b) => scores[b] - scores[a]);
-        const topIndices = highScoreIndices.slice(0, 1).filter(index => scores[index] >= 0.8); // Seuil plus strict
+          const cropX = Math.max(0, Math.min(roi.xMin, frame.width - 1));
+          const cropY = Math.max(0, Math.min(roi.yMin, frame.height - 1));
+          const cropWidth = Math.max(1, Math.min(roi.wPx, frame.width - cropX));
+          const cropHeight = Math.max(1, Math.min(roi.hPx, frame.height - cropY));
 
-        if (topIndices.length === 0) {
-          onHandsDetected(0);
-          onLandmarksDetected({
-            landmarks: [],
-            frameWidth: frame.width,
-            frameHeight: frame.height,
-          });
-          onFrameProcessed();
-          return;
-        }
-
-        const allLandmarks: Array<Array<{x: number, y: number}>> = [];
-
-        // 5) Approche simplifiée : traiter seulement la première main détectée
-        // Pour l'instant, on fait un crop centré qui devrait contenir la main principale
-        if (topIndices.length > 0) {
-          const frameWidth = frame.width;
-          const frameHeight = frame.height;
-
-          // Crop d'environ 70% de la frame centrée (devrait contenir une main normale)
-          const cropSize = Math.min(frameWidth, frameHeight) * 0.7;
-          const cropX = Math.max(0, (frameWidth - cropSize) / 2);
-          const cropY = Math.max(0, (frameHeight - cropSize) / 2);
-          const cropWidth = Math.min(cropSize, frameWidth - cropX);
-          const cropHeight = Math.min(cropSize, frameHeight - cropY);
-
-          // 6) Recadrer l'image originale sur la région de la main
           const handPatch = resize(frame, {
             crop: {
               x: cropX,
@@ -446,50 +450,36 @@ const hasSignificantMovement = (
               height: cropHeight,
             },
             scale: {
-              width: landmarksWidth, // 224x224 pour le modèle de landmarks
+              width: landmarksWidth,
               height: landmarksHeight,
             },
             pixelFormat: 'rgb',
             dataType: landmarksDataType === 'float32' ? 'float32' : 'uint8',
           });
 
-          // 7) Exécuter le modèle de landmarks sur le patch
-          const landmarksOutputs = landmarkModel.runSync([handPatch]);
-
-          // Le modèle retourne généralement [1, 63] pour 21 points (x,y,z)
-          const landmarksData = landmarksOutputs[0] as Float32Array;
-          const handLandmarks: Array<{x: number, y: number}> = [];
-
-          // 7) Extraire les 21 points de repère (x,y seulement pour l'affichage)
-          for (let i = 0; i < 21; i++) {
-            const baseIdx = i * 3; // chaque point a x,y,z
-            const x = landmarksData[baseIdx] / landmarksWidth; // normalisé 0-1 dans le patch
-            const y = landmarksData[baseIdx + 1] / landmarksHeight;
-
-            // Convertir les coordonnées du patch vers l'image caméra originale
-            // Le patch est centré dans la frame, donc on translate simplement
-            const screenX = cropX + (x * cropWidth);
-            const screenY = cropY + (y * cropHeight);
-
-            handLandmarks.push({x: screenX, y: screenY});
-          }
-
-          allLandmarks.push(handLandmarks);
+          const landmarkOutputs = landmarkModel.runSync([handPatch]) as Array<Float32Array>;
+          landmarkResults.push(parseLandmarkResult(landmarkOutputs));
         }
 
-        // 8) Mettre à jour les callbacks
-        onHandsDetected(Math.min(topIndices.length, 1)); // Pour l'instant limité à 1 main
-        onLandmarksDetected({
-          landmarks: allLandmarks,
-          frameWidth: frame.width,
-          frameHeight: frame.height,
+        const interpretation = interpretFrame(detectorOutput, landmarkResults, anchors, meta, {
+          precomputed: prepared,
+          includePerformanceMetrics: true,
         });
-        onFrameProcessed();
 
-        // Debug supprimé pour réduire la surcharge
+        onSceneUpdated(interpretation);
+        onFrameProcessed();
       });
     },
-    [detectorModel, detectorInputSize, landmarkModel, landmarksInputSize, resize, onHandsDetected, onLandmarksDetected, onFrameProcessed],
+    [
+      detectorModel,
+      detectorInputSize,
+      landmarkModel,
+      landmarksInputSize,
+      resize,
+      anchors,
+      onSceneUpdated,
+      onFrameProcessed,
+    ],
   );
 
   // Utiliser le nouveau frame processor pour la détection de mains
@@ -548,63 +538,122 @@ const hasSignificantMovement = (
 
         {/* Overlay pour afficher les landmarks des mains */}
         <View pointerEvents="none" style={StyleSheet.absoluteFill}>
-          {(useSmoothedLandmarks ? smoothedLandmarks : detectedLandmarks).map(
-            (handLandmarks, handIndex) => {
-              const mappedPoints = handLandmarks.map(mapPointToScreen);
-              return (
-                <View key={handIndex} style={StyleSheet.absoluteFill}>
-                  {HAND_CONNECTIONS.map(([startIdx, endIdx], connectionIndex) => {
-                    const start = mappedPoints[startIdx];
-                    const end = mappedPoints[endIdx];
-                    if (!start || !end) return null;
+          {handsForDisplay.map((hand) => {
+            const mappedPoints = hand.landmarks.map(mapPointToScreen);
+            const accentColor = hand.handedness === 'Left' ? '#5AD1FF' : '#FF7A5C';
+            const topLeft = mapPointToScreen({ x: hand.detectionBox.xMin, y: hand.detectionBox.yMin });
+            const bottomRight = mapPointToScreen({
+              x: hand.detectionBox.xMax,
+              y: hand.detectionBox.yMax,
+            });
+            const boxWidth = Math.max(0, bottomRight.left - topLeft.left);
+            const boxHeight = Math.max(0, bottomRight.top - topLeft.top);
 
-                    const dx = end.left - start.left;
-                    const dy = end.top - start.top;
-                    const length = Math.hypot(dx, dy);
-                    if (length === 0) return null;
+            return (
+              <View key={hand.id} style={StyleSheet.absoluteFill}>
+                <View
+                  style={[
+                    styles.handBox,
+                    {
+                      left: topLeft.left,
+                      top: topLeft.top,
+                      width: boxWidth,
+                      height: boxHeight,
+                      borderColor: accentColor,
+                    },
+                  ]}
+                />
+                <View
+                  style={[
+                    styles.handLabel,
+                    {
+                      left: topLeft.left,
+                      top: Math.max(0, topLeft.top - 28),
+                      borderColor: accentColor,
+                      backgroundColor: `${accentColor}33`,
+                    },
+                  ]}
+                >
+                  <Text style={styles.handLabelText}>
+                    {hand.handedness} · {(hand.qualityScore * 100).toFixed(0)}%
+                  </Text>
+                  <Text style={styles.handLabelSubText}>
+                    {hand.pose.isPinching
+                      ? `Pinch ${(hand.pose.pinchStrength * 100).toFixed(0)}%`
+                      : `Écart ${(hand.pose.spread * 100).toFixed(0)}%`}
+                  </Text>
+                </View>
 
-                    const angle = (Math.atan2(dy, dx) * 180) / Math.PI;
-                    const centerX = (start.left + end.left) / 2;
-                    const centerY = (start.top + end.top) / 2;
+                {HAND_CONNECTIONS.map(([startIdx, endIdx]) => {
+                  const start = mappedPoints[startIdx];
+                  const end = mappedPoints[endIdx];
+                  if (!start || !end) return null;
 
-                    return (
-                      <View
-                        key={`line-${handIndex}-${connectionIndex}`}
-                        style={[
-                          styles.landmarkLine,
-                          {
-                            width: length,
-                            left: centerX - length / 2,
-                            top: centerY - LANDMARK_LINE_THICKNESS / 2,
-                            transform: [{ rotate: `${angle}deg` }],
-                          },
-                        ]}
-                      />
-                    );
-                  })}
+                  const dx = end.left - start.left;
+                  const dy = end.top - start.top;
+                  const length = Math.hypot(dx, dy);
+                  if (length === 0) return null;
 
-                  {mappedPoints.map((point, pointIndex) => (
+                  const angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+                  const centerX = (start.left + end.left) / 2;
+                  const centerY = (start.top + end.top) / 2;
+
+                  return (
                     <View
-                      key={`point-${handIndex}-${pointIndex}`}
+                      key={`line-${hand.id}-${startIdx}-${endIdx}`}
                       style={[
-                        styles.landmarkPoint,
+                        styles.landmarkLine,
                         {
-                          left: point.left,
-                          top: point.top,
+                          width: length,
+                          left: centerX - length / 2,
+                          top: centerY - LANDMARK_LINE_THICKNESS / 2,
+                          transform: [{ rotate: `${angle}deg` }],
+                          backgroundColor: accentColor,
                         },
                       ]}
                     />
-                  ))}
-                </View>
-              );
-            },
-          )}
+                  );
+                })}
+
+                {mappedPoints.map((point, pointIndex) => (
+                  <View
+                    key={`point-${hand.id}-${pointIndex}`}
+                    style={[
+                      styles.landmarkPoint,
+                      {
+                        left: point.left,
+                        top: point.top,
+                        backgroundColor: accentColor,
+                      },
+                    ]}
+                  />
+                ))}
+              </View>
+            );
+          })}
+          {sceneInterpretation?.interHandRelations
+            ?.filter((relation) => relation.type !== 'Unknown' && relation.confidence > 0.5)
+            .map((relation) => (
+              <View
+                key={`${relation.handIdA}-${relation.handIdB}-${relation.type}`}
+                style={styles.relationBadge}
+              >
+                <Text style={styles.relationBadgeText}>
+                  {relation.type === 'HandshakeCandidate' ? '🤝' : '✋'} {relation.type}
+                </Text>
+              </View>
+            ))}
         </View>
       </View>
 
       <View style={styles.topOverlay}>
         <Text style={styles.infoText}>Frames traitées: {detectionCount}</Text>
         <Text style={styles.infoText}>Mains détectées: {detectedHandsCount}</Text>
+        {sceneInterpretation?.rawMeta.processingTimeMs != null && (
+          <Text style={styles.infoText}>
+            Interp: {sceneInterpretation.rawMeta.processingTimeMs.toFixed(1)} ms
+          </Text>
+        )}
         <TouchableOpacity
           style={styles.toggleButton}
           onPress={() => setUseSmoothedLandmarks(!useSmoothedLandmarks)}
@@ -642,6 +691,50 @@ const hasSignificantMovement = (
     </View>
   );
 }
+
+const clampProbability = (value: number): number => {
+  'worklet';
+  if (Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+};
+
+const parseLandmarkResult = (outputs: Float32Array[]): MLRawLandmarksOutput => {
+  'worklet';
+  const landmarks = outputs[0] ?? new Float32Array(63);
+  let handednessScore = 0.5;
+  let handedness: 'Left' | 'Right' = 'Right';
+  let presenceScore: number | undefined;
+  let visibility: Float32Array | undefined;
+  let scalarConsumed = false;
+
+  for (let i = 1; i < outputs.length; i++) {
+    const tensor = outputs[i];
+    if (!tensor) continue;
+    if (tensor.length === 1) {
+      if (!scalarConsumed) {
+        presenceScore = clampProbability(tensor[0]);
+        scalarConsumed = true;
+      } else {
+        handednessScore = clampProbability(tensor[0]);
+      }
+    } else if (tensor.length === 2) {
+      handednessScore = clampProbability(tensor[1]);
+    } else if (!visibility && (tensor.length === 21 || tensor.length === 63)) {
+      visibility = tensor;
+    }
+  }
+
+  handedness = handednessScore >= 0.5 ? 'Right' : 'Left';
+
+  return {
+    landmarks,
+    handedness,
+    handednessScore,
+    presenceScore,
+    visibility,
+    landmarkScore: presenceScore ?? handednessScore,
+  };
+};
 
 const styles = StyleSheet.create({
   container: {
@@ -713,6 +806,41 @@ const styles = StyleSheet.create({
     height: LANDMARK_LINE_THICKNESS,
     backgroundColor: 'white',
     borderRadius: LANDMARK_LINE_THICKNESS / 2,
+  },
+  handBox: {
+    position: 'absolute',
+    borderWidth: 2,
+    borderRadius: 10,
+  },
+  handLabel: {
+    position: 'absolute',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    backgroundColor: '#ffffff40',
+  },
+  handLabelText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  handLabelSubText: {
+    color: 'white',
+    fontSize: 10,
+  },
+  relationBadge: {
+    alignSelf: 'center',
+    marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    backgroundColor: '#ffffff30',
+  },
+  relationBadgeText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '600',
   },
   toggleButton: {
     backgroundColor: '#ffffff40',
