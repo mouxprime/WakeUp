@@ -28,9 +28,47 @@ type HandLandmarksPayload = {
   frameHeight: number;
 };
 
+const HAND_CONNECTIONS: Array<[number, number]> = [
+  [0, 1],
+  [1, 2],
+  [2, 3],
+  [3, 4], // pouce
+  [0, 5],
+  [5, 6],
+  [6, 7],
+  [7, 8], // index
+  [0, 9],
+  [9, 10],
+  [10, 11],
+  [11, 12], // majeur
+  [0, 13],
+  [13, 14],
+  [14, 15],
+  [15, 16], // annulaire
+  [0, 17],
+  [17, 18],
+  [18, 19],
+  [19, 20], // auriculaire
+  [5, 9],
+  [9, 13],
+  [13, 17], // paume
+];
+
+const LANDMARK_LINE_THICKNESS = 2;
+
 export default function App() {
-  const device = useCameraDevice('back');
+  const ultraWideDevice = useCameraDevice('back', {
+    physicalDevices: ['ultra-wide-angle-camera'],
+  });
+  const wideDevice = useCameraDevice('back', {
+    physicalDevices: ['wide-angle-camera'],
+  });
+  const fallbackDevice = useCameraDevice('back');
   const windowDimensions = useWindowDimensions();
+  const previewSize = React.useMemo(
+    () => Math.min(windowDimensions.width, windowDimensions.height),
+    [windowDimensions.width, windowDimensions.height],
+  );
   const { hasPermission, requestPermission } = useCameraPermission();
   const cameraRef = useRef<Camera>(null);
 
@@ -42,15 +80,24 @@ export default function App() {
   const [detectedLandmarks, setDetectedLandmarks] = useState<Array<Array<HandPoint>>>([]);
   const [smoothedLandmarks, setSmoothedLandmarks] = useState<Array<Array<HandPoint>>>([]);
   const [useSmoothedLandmarks, setUseSmoothedLandmarks] = useState(true); // Par défaut activé pour stabilité
+  const [currentLens, setCurrentLens] = useState<'ultra' | 'wide'>('ultra');
   const frameDimensionsRef = useRef({ width: 0, height: 0 });
   const landmarkHistoryRef = useRef<Array<Array<Array<HandPoint>>>>([]);
-  const maxHistorySize = 5;
+  const maxHistorySize = 3;
 
   useEffect(() => {
     if (!hasPermission) {
       requestPermission();
     }
   }, [hasPermission, requestPermission]);
+
+  useEffect(() => {
+    if (currentLens === 'ultra' && !ultraWideDevice && wideDevice) {
+      setCurrentLens('wide');
+    } else if (currentLens === 'wide' && !wideDevice && ultraWideDevice) {
+      setCurrentLens('ultra');
+    }
+  }, [currentLens, ultraWideDevice, wideDevice]);
 
   // Debug : chargement “manuel” des modèles pour inspecter les shapes
   useEffect(() => {
@@ -74,6 +121,16 @@ export default function App() {
       }
     })();
   }, []);
+
+  const activeDevice = React.useMemo(() => {
+    if (currentLens === 'ultra') {
+      return ultraWideDevice ?? wideDevice ?? fallbackDevice;
+    }
+    return wideDevice ?? ultraWideDevice ?? fallbackDevice;
+  }, [currentLens, ultraWideDevice, wideDevice, fallbackDevice]);
+
+  const isUltraAvailable = ultraWideDevice != null;
+  const isWideAvailable = wideDevice != null;
 
   const handleFrameAnalyzed = useCallback((result: FrameAnalysisResult) => {
     setDetectionCount((c) => c + 1);
@@ -136,13 +193,65 @@ export default function App() {
     []
   );
 
+  const handleToggleLensMode = useCallback(() => {
+    if (currentLens === 'ultra') {
+      if (isWideAvailable) {
+        setCurrentLens('wide');
+      }
+    } else if (isUltraAvailable) {
+      setCurrentLens('ultra');
+    }
+  }, [currentLens, isUltraAvailable, isWideAvailable]);
+
   const cloneLandmarks = (hands: Array<Array<HandPoint>>): Array<Array<HandPoint>> =>
     hands.map((hand) => hand.map((point) => ({ ...point })));
+
+const hasSignificantMovement = (
+  current: Array<Array<HandPoint>>,
+  previous: Array<Array<HandPoint>>,
+  threshold: number,
+): boolean => {
+  for (let handIndex = 0; handIndex < current.length; handIndex++) {
+    const currentHand = current[handIndex];
+    const previousHand = previous[handIndex];
+
+    if (!previousHand || currentHand.length !== previousHand.length) {
+      continue;
+    }
+
+    for (let i = 0; i < currentHand.length; i++) {
+      const dx = currentHand[i].x - previousHand[i].x;
+      const dy = currentHand[i].y - previousHand[i].y;
+      if (Math.hypot(dx, dy) > threshold) {
+        return true;
+      }
+    }
+  }
+  return false;
+};
 
   // Fonction pour lisser les landmarks (réduire le bruit avec un buffer circulaire)
   const smoothLandmarks = (current: Array<Array<HandPoint>>): Array<Array<HandPoint>> => {
     if (current.length === 0) {
       landmarkHistoryRef.current = [];
+      return current;
+    }
+
+    const previousFrame =
+      landmarkHistoryRef.current[landmarkHistoryRef.current.length - 1];
+
+    const frameMinSize =
+      Math.min(
+        frameDimensionsRef.current.width || previewSize || 0,
+        frameDimensionsRef.current.height || previewSize || 0,
+      ) || 1;
+    const movementThreshold = frameMinSize * 0.08; // 8% du plus petit côté
+
+    if (
+      previousFrame &&
+      hasSignificantMovement(current, previousFrame, movementThreshold)
+    ) {
+      landmarkHistoryRef.current = [cloneLandmarks(current)];
       return current;
     }
 
@@ -205,27 +314,22 @@ export default function App() {
     (point: HandPoint) => {
       const frameWidth = frameDimensionsRef.current.width;
       const frameHeight = frameDimensionsRef.current.height;
-      const screenWidth = windowDimensions.width;
-      const screenHeight = windowDimensions.height;
+      const displayWidth = previewSize || 1;
+      const displayHeight = previewSize || 1;
 
-      if (
-        frameWidth === 0 ||
-        frameHeight === 0 ||
-        screenWidth === 0 ||
-        screenHeight === 0
-      ) {
-        return { leftPercent: 0, topPercent: 0 };
+      if (frameWidth === 0 || frameHeight === 0) {
+        return { left: 0, top: 0 };
       }
 
       const sensorIsLandscape = frameWidth >= frameHeight;
-      const screenIsPortrait = screenHeight >= screenWidth;
+      const displayIsPortrait = displayHeight >= displayWidth;
 
       let x = point.x;
       let y = point.y;
       let imageWidth = frameWidth;
       let imageHeight = frameHeight;
 
-      if (sensorIsLandscape && screenIsPortrait) {
+      if (sensorIsLandscape && displayIsPortrait) {
         const rotatedX = frameHeight - y;
         const rotatedY = x;
         x = rotatedX;
@@ -234,28 +338,25 @@ export default function App() {
         imageHeight = frameWidth;
       }
 
-      const scale = Math.max(screenWidth / imageWidth, screenHeight / imageHeight);
+      const scale = Math.max(displayWidth / imageWidth, displayHeight / imageHeight);
       const scaledWidth = imageWidth * scale;
       const scaledHeight = imageHeight * scale;
-      const offsetX = (scaledWidth - screenWidth) / 2;
-      const offsetY = (scaledHeight - screenHeight) / 2;
+      const offsetX = (scaledWidth - displayWidth) / 2;
+      const offsetY = (scaledHeight - displayHeight) / 2;
 
       let pixelX = x * scale - offsetX;
       let pixelY = y * scale - offsetY;
 
-      if (device?.position === 'front') {
-        pixelX = screenWidth - pixelX;
+      if (activeDevice?.position === 'front') {
+        pixelX = displayWidth - pixelX;
       }
 
-      const leftPercent = (pixelX / screenWidth) * 100;
-      const topPercent = (pixelY / screenHeight) * 100;
-
       return {
-        leftPercent: Math.max(0, Math.min(100, leftPercent)),
-        topPercent: Math.max(0, Math.min(100, topPercent)),
+        left: Math.max(0, Math.min(displayWidth, pixelX)),
+        top: Math.max(0, Math.min(displayHeight, pixelY)),
       };
     },
-    [device?.position, windowDimensions.height, windowDimensions.width],
+    [activeDevice?.position, previewSize],
   );
 
   // Nouveau frame processor pour la détection de mains et landmarks
@@ -270,7 +371,7 @@ export default function App() {
       const { width: detectorWidth, height: detectorHeight, dataType: detectorDataType } = detectorInputSize;
       const { width: landmarksWidth, height: landmarksHeight, dataType: landmarksDataType } = landmarksInputSize;
 
-      runAtTargetFps(10, () => {
+      runAtTargetFps(20, () => {
 
         // 1) Resize la frame au format attendu par le modèle de détection (192x192)
         const resized = resize(frame, {
@@ -394,6 +495,10 @@ export default function App() {
   // Utiliser le nouveau frame processor pour la détection de mains
   const frameProcessor = handDetectionFrameProcessor;
 
+  const isUltraActive = activeDevice === ultraWideDevice && ultraWideDevice != null;
+  const zoomLabel = isUltraActive ? 'x0.5' : 'x1';
+  const canToggleLens = isUltraAvailable && isWideAvailable;
+
   const handleTakePhoto = useCallback(async () => {
     if (!cameraRef.current || isTakingPhoto) return;
 
@@ -408,7 +513,7 @@ export default function App() {
     }
   }, [isTakingPhoto]);
 
-  if (!device) {
+  if (!activeDevice) {
     return (
       <View style={styles.center}>
         <Text>Aucun device caméra trouvé</Text>
@@ -426,14 +531,76 @@ export default function App() {
 
   return (
     <View style={styles.container}>
+      <View
+        style={[
+          styles.previewContainer,
+          { width: previewSize, height: previewSize },
+        ]}
+      >
       <Camera
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
-        device={device}
+          device={activeDevice}
         isActive={!isTakingPhoto}
         photo
         frameProcessor={frameProcessor}
       />
+
+        {/* Overlay pour afficher les landmarks des mains */}
+        <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+          {(useSmoothedLandmarks ? smoothedLandmarks : detectedLandmarks).map(
+            (handLandmarks, handIndex) => {
+              const mappedPoints = handLandmarks.map(mapPointToScreen);
+              return (
+                <View key={handIndex} style={StyleSheet.absoluteFill}>
+                  {HAND_CONNECTIONS.map(([startIdx, endIdx], connectionIndex) => {
+                    const start = mappedPoints[startIdx];
+                    const end = mappedPoints[endIdx];
+                    if (!start || !end) return null;
+
+                    const dx = end.left - start.left;
+                    const dy = end.top - start.top;
+                    const length = Math.hypot(dx, dy);
+                    if (length === 0) return null;
+
+                    const angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+                    const centerX = (start.left + end.left) / 2;
+                    const centerY = (start.top + end.top) / 2;
+
+                    return (
+                      <View
+                        key={`line-${handIndex}-${connectionIndex}`}
+                        style={[
+                          styles.landmarkLine,
+                          {
+                            width: length,
+                            left: centerX - length / 2,
+                            top: centerY - LANDMARK_LINE_THICKNESS / 2,
+                            transform: [{ rotate: `${angle}deg` }],
+                          },
+                        ]}
+                      />
+                    );
+                  })}
+
+                  {mappedPoints.map((point, pointIndex) => (
+                    <View
+                      key={`point-${handIndex}-${pointIndex}`}
+                      style={[
+                        styles.landmarkPoint,
+                        {
+                          left: point.left,
+                          top: point.top,
+                        },
+                      ]}
+                    />
+                  ))}
+                </View>
+              );
+            },
+          )}
+        </View>
+      </View>
 
       <View style={styles.topOverlay}>
         <Text style={styles.infoText}>Frames traitées: {detectionCount}</Text>
@@ -451,6 +618,16 @@ export default function App() {
       <View style={styles.bottomOverlay}>
         <TouchableOpacity
           style={[
+            styles.zoomButton,
+            !canToggleLens && styles.zoomButtonDisabled,
+          ]}
+          onPress={handleToggleLensMode}
+          disabled={!canToggleLens}
+        >
+          <Text style={styles.zoomButtonText}>{zoomLabel}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[
             styles.shutterButton,
             isTakingPhoto && styles.shutterButtonDisabled,
           ]}
@@ -462,37 +639,24 @@ export default function App() {
           </Text>
         </TouchableOpacity>
       </View>
-
-      {/* Overlay pour afficher les landmarks des mains */}
-      <View style={StyleSheet.absoluteFill}>
-        {(useSmoothedLandmarks ? smoothedLandmarks : detectedLandmarks).map((handLandmarks, handIndex) => (
-          <View key={handIndex} style={StyleSheet.absoluteFill}>
-            {handLandmarks.map((landmark, pointIndex) => {
-              const { leftPercent, topPercent } = mapPointToScreen(landmark);
-
-              return (
-                <View
-                  key={pointIndex}
-                  style={[
-                    styles.landmarkPoint,
-                    {
-                      left: `${leftPercent}%`,
-                      top: `${topPercent}%`,
-                    },
-                  ]}
-                />
-              );
-            })}
-          </View>
-        ))}
-      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: 'black' },
+  container: {
+    flex: 1,
+    backgroundColor: 'black',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  previewContainer: {
+    position: 'relative',
+    overflow: 'hidden',
+    borderRadius: 16,
+    backgroundColor: 'black',
+  },
   topOverlay: {
     position: 'absolute',
     top: 60,
@@ -506,6 +670,23 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   infoText: { color: 'white', fontSize: 14, marginBottom: 4 },
+  zoomButton: {
+    marginBottom: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#ffffff80',
+    backgroundColor: '#00000080',
+  },
+  zoomButtonDisabled: {
+    opacity: 0.5,
+  },
+  zoomButtonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '600',
+  },
   shutterButton: {
     width: 80,
     height: 80,
@@ -526,6 +707,12 @@ const styles = StyleSheet.create({
     backgroundColor: 'red',
     borderWidth: 2,
     borderColor: 'white',
+  },
+  landmarkLine: {
+    position: 'absolute',
+    height: LANDMARK_LINE_THICKNESS,
+    backgroundColor: 'white',
+    borderRadius: LANDMARK_LINE_THICKNESS / 2,
   },
   toggleButton: {
     backgroundColor: '#ffffff40',
